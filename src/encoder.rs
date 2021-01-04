@@ -1,7 +1,6 @@
 extern crate crc32fast;
 extern crate deflate;
 
-use std::borrow::Cow;
 use std::error;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -10,9 +9,12 @@ use std::result;
 
 use crc32fast::Hasher as Crc32;
 
-use crate::chunk;
-use crate::common::{BitDepth, BytesPerPixel, ColorType, Compression, Info, ScaledFloat};
-use crate::filter::{filter, FilterType};
+use crate::chunk::{self, ChunkType};
+use crate::common::{
+    BitDepth, BytesPerPixel, ColorType, Compression, Info, ParameterError, ParameterErrorKind,
+    ScaledFloat,
+};
+use crate::filter::{filter, AdaptiveFilterType, FilterType};
 use crate::traits::WriteBytesExt;
 
 pub type Result<T> = result::Result<T, EncodingError>;
@@ -20,7 +22,24 @@ pub type Result<T> = result::Result<T, EncodingError>;
 #[derive(Debug)]
 pub enum EncodingError {
     IoError(io::Error),
-    Format(Cow<'static, str>),
+    Format(FormatError),
+    Parameter(ParameterError),
+    LimitsExceeded,
+}
+
+#[derive(Debug)]
+pub struct FormatError {
+    inner: FormatErrorKind,
+}
+
+#[derive(Debug)]
+enum FormatErrorKind {
+    ZeroWidth,
+    ZeroHeight,
+    InvalidColorCombination(BitDepth, ColorType),
+    NoPalette,
+    // TODO: wait, what?
+    WrittenTooMuch(usize),
 }
 
 impl error::Error for EncodingError {
@@ -38,6 +57,25 @@ impl fmt::Display for EncodingError {
         match self {
             IoError(err) => write!(fmt, "{}", err),
             Format(desc) => write!(fmt, "{}", desc),
+            Parameter(desc) => write!(fmt, "{}", desc),
+            LimitsExceeded => write!(fmt, "Limits are exceeded."),
+        }
+    }
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> result::Result<(), fmt::Error> {
+        use FormatErrorKind::*;
+        match self.inner {
+            ZeroWidth => write!(fmt, "Zero width not allowed"),
+            ZeroHeight => write!(fmt, "Zero height not allowed"),
+            InvalidColorCombination(depth, color) => write!(
+                fmt,
+                "Invalid combination of bit-depth '{:?}' and color-type '{:?}'",
+                depth, color
+            ),
+            NoPalette => write!(fmt, "can't write indexed image without palette"),
+            WrittenTooMuch(index) => write!(fmt, "wrong data size, got {} bytes too many", index),
         }
     }
 }
@@ -47,9 +85,17 @@ impl From<io::Error> for EncodingError {
         EncodingError::IoError(err)
     }
 }
+
 impl From<EncodingError> for io::Error {
     fn from(err: EncodingError) -> io::Error {
         io::Error::new(io::ErrorKind::Other, err.to_string())
+    }
+}
+
+// Private impl.
+impl From<FormatErrorKind> for FormatError {
+    fn from(kind: FormatErrorKind) -> Self {
+        FormatError { inner: kind }
     }
 }
 
@@ -57,6 +103,8 @@ impl From<EncodingError> for io::Error {
 pub struct Encoder<W: Write> {
     w: W,
     info: Info,
+    filter: FilterType,
+    adaptive_filter: AdaptiveFilterType,
 }
 
 impl<W: Write> Encoder<W> {
@@ -64,7 +112,12 @@ impl<W: Write> Encoder<W> {
         let mut info = Info::default();
         info.width = width;
         info.height = height;
-        Encoder { w, info }
+        Encoder {
+            w,
+            info,
+            filter: FilterType::default(),
+            adaptive_filter: AdaptiveFilterType::default(),
+        }
     }
 
     pub fn set_palette(&mut self, palette: Vec<u8>) {
@@ -89,8 +142,16 @@ impl<W: Write> Encoder<W> {
         self.info.source_chromaticities = Some(source_chromaticities);
     }
 
+    /// Mark the image data as conforming to the SRGB color space with the specified rendering intent.
+    ///
+    /// Matching source gamma and chromaticities chunks are added automatically.
+    /// Any manually specified source gamma or chromaticities will be ignored.
+    pub fn set_srgb(&mut self, rendering_intent: super::SrgbRenderingIntent) {
+        self.info.srgb = Some(rendering_intent);
+    }
+
     pub fn write_header(self) -> Result<Writer<W>> {
-        Writer::new(self.w, self.info).init()
+        Writer::new(self.w, self.info, self.filter, self.adaptive_filter).init()
     }
 
     /// Set the color of the encoded image.
@@ -124,7 +185,19 @@ impl<W: Write> Encoder<W> {
     /// [`FilterType::Sub`]: enum.FilterType.html#variant.Sub
     /// [`FilterType::Paeth`]: enum.FilterType.html#variant.Paeth
     pub fn set_filter(&mut self, filter: FilterType) {
-        self.info.filter = filter;
+        self.filter = filter;
+    }
+
+    /// Set the adaptive filter type.
+    ///
+    /// Adaptive filtering attempts to select the best filter for each line
+    /// based on heuristics which minimize the file size for compression rather
+    /// than use a single filter for the entire image. The default method is
+    /// [`AdaptiveFilterType::NonAdaptive`].
+    ///
+    /// [`AdaptiveFilterType::NonAdaptive`]: enum.AdaptiveFilterType.html
+    pub fn set_adaptive_filter(&mut self, adaptive_filter: AdaptiveFilterType) {
+        self.adaptive_filter = adaptive_filter;
     }
 }
 
@@ -132,33 +205,40 @@ impl<W: Write> Encoder<W> {
 pub struct Writer<W: Write> {
     w: W,
     info: Info,
+    filter: FilterType,
+    adaptive_filter: AdaptiveFilterType,
 }
 
 const DEFAULT_BUFFER_LENGTH: usize = 4 * 1024;
 
-fn write_chunk<W: Write>(mut w: W, name: [u8; 4], data: &[u8]) -> Result<()> {
+fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8]) -> Result<()> {
     w.write_be(data.len() as u32)?;
-    w.write_all(&name)?;
+    w.write_all(&name.0)?;
     w.write_all(data)?;
     let mut crc = Crc32::new();
-    crc.update(&name);
+    crc.update(&name.0);
     crc.update(data);
     w.write_be(crc.finalize())?;
     Ok(())
 }
 
 impl<W: Write> Writer<W> {
-    fn new(w: W, info: Info) -> Writer<W> {
-        Writer { w, info }
+    fn new(w: W, info: Info, filter: FilterType, adaptive_filter: AdaptiveFilterType) -> Writer<W> {
+        Writer {
+            w,
+            info,
+            filter,
+            adaptive_filter,
+        }
     }
 
     fn init(mut self) -> Result<Self> {
         if self.info.width == 0 {
-            return Err(EncodingError::Format("Zero width not allowed".into()));
+            return Err(EncodingError::Format(FormatErrorKind::ZeroWidth.into()));
         }
 
         if self.info.height == 0 {
-            return Err(EncodingError::Format("Zero height not allowed".into()));
+            return Err(EncodingError::Format(FormatErrorKind::ZeroHeight.into()));
         }
 
         // TODO: this could yield the typified BytesPerPixel.
@@ -168,11 +248,8 @@ impl<W: Write> Writer<W> {
             .is_combination_invalid(self.info.bit_depth)
         {
             return Err(EncodingError::Format(
-                format!(
-                    "Invalid combination of bit-depth '{:?}' and color-type '{:?}'",
-                    self.info.bit_depth, self.info.color_type
-                )
-                .into(),
+                FormatErrorKind::InvalidColorCombination(self.info.bit_depth, self.info.color_type)
+                    .into(),
             ));
         }
 
@@ -193,13 +270,23 @@ impl<W: Write> Writer<W> {
             write_chunk(&mut self.w, chunk::tRNS, t)?;
         }
 
-        if let Some(g) = &self.info.source_gamma {
-            write_chunk(&mut self.w, chunk::gAMA, &g.into_scaled().to_be_bytes())?;
-        }
+        // If specified, the sRGB information overrides the source gamma and chromaticities.
+        if let Some(srgb) = &self.info.srgb {
+            let gamma = crate::srgb::substitute_gamma().into_scaled().to_be_bytes();
+            let chromaticities =
+                Self::chromaticities_to_be_bytes(&crate::srgb::substitute_chromaticities());
+            write_chunk(&mut self.w, chunk::sRGB, &[srgb.into_raw()])?;
+            write_chunk(&mut self.w, chunk::gAMA, &gamma)?;
+            write_chunk(&mut self.w, chunk::cHRM, &chromaticities)?;
+        } else {
+            if let Some(g) = &self.info.source_gamma {
+                write_chunk(&mut self.w, chunk::gAMA, &g.into_scaled().to_be_bytes())?;
+            }
 
-        if let Some(c) = &self.info.source_chromaticities {
-            let enc = Self::chromaticities_to_be_bytes(&c);
-            write_chunk(&mut self.w, chunk::cHRM, &enc)?;
+            if let Some(c) = &self.info.source_chromaticities {
+                let enc = Self::chromaticities_to_be_bytes(&c);
+                write_chunk(&mut self.w, chunk::cHRM, &enc)?;
+            }
         }
 
         Ok(self)
@@ -227,7 +314,7 @@ impl<W: Write> Writer<W> {
         ]
     }
 
-    pub fn write_chunk(&mut self, name: [u8; 4], data: &[u8]) -> Result<()> {
+    pub fn write_chunk(&mut self, name: ChunkType, data: &[u8]) -> Result<()> {
         write_chunk(&mut self.w, name, data)
     }
 
@@ -236,9 +323,7 @@ impl<W: Write> Writer<W> {
         const MAX_CHUNK_LEN: u32 = (1u32 << 31) - 1;
 
         if self.info.color_type == ColorType::Indexed && self.info.palette.is_none() {
-            return Err(EncodingError::Format(
-                "can't write indexed image without palette".into(),
-            ));
+            return Err(EncodingError::Format(FormatErrorKind::NoPalette.into()));
         }
 
         let bpp = self.info.bpp_in_prediction();
@@ -248,15 +333,21 @@ impl<W: Write> Writer<W> {
         let mut current = vec![0; in_len];
         let data_size = in_len * self.info.height as usize;
         if data_size != data.len() {
-            let message = format!("wrong data size, expected {} got {}", data_size, data.len());
-            return Err(EncodingError::Format(message.into()));
+            return Err(EncodingError::Parameter(
+                ParameterErrorKind::ImageBufferSize {
+                    expected: data_size,
+                    actual: data.len(),
+                }
+                .into(),
+            ));
         }
         let mut zlib = deflate::write::ZlibEncoder::new(Vec::new(), self.info.compression.clone());
-        let filter_method = self.info.filter;
+        let filter_method = self.filter;
+        let adaptive_method = self.adaptive_filter;
         for line in data.chunks(in_len) {
             current.copy_from_slice(&line);
-            zlib.write_all(&[filter_method as u8])?;
-            filter(filter_method, bpp, &prev, &mut current);
+            let filter_type = filter(filter_method, adaptive_method, bpp, &prev, &mut current);
+            zlib.write_all(&[filter_type as u8])?;
             zlib.write_all(&current)?;
             prev = line;
         }
@@ -267,14 +358,14 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Create an stream writer.
+    /// Create a stream writer.
     ///
-    /// This allows you create images that do not fit in memory. The default
-    /// chunk size is 4K, use `stream_writer_with_size` to set another chuck
+    /// This allows you to create images that do not fit in memory. The default
+    /// chunk size is 4K, use `stream_writer_with_size` to set another chunk
     /// size.
     ///
-    /// This borrows the writer. This preserves it which allows manually
-    /// appending additional chunks after the image data has been written
+    /// This borrows the writer which allows for manually appending additional
+    /// chunks after the image data has been written.
     pub fn stream_writer(&mut self) -> StreamWriter<W> {
         self.stream_writer_with_size(DEFAULT_BUFFER_LENGTH)
     }
@@ -290,8 +381,8 @@ impl<W: Write> Writer<W> {
 
     /// Turn this into a stream writer for image data.
     ///
-    /// This allows you create images that do not fit in memory. The default
-    /// chunk size is 4K, use `stream_writer_with_size` to set another chuck
+    /// This allows you to create images that do not fit in memory. The default
+    /// chunk size is 4K, use `stream_writer_with_size` to set another chunk
     /// size.
     pub fn into_stream_writer(self) -> StreamWriter<'static, W> {
         self.into_stream_writer_with_size(DEFAULT_BUFFER_LENGTH)
@@ -375,7 +466,7 @@ impl<'a, W: Write> Drop for ChunkWriter<'a, W> {
     }
 }
 
-/// Streaming png writer
+/// Streaming PNG writer
 ///
 /// This may silently fail in the destructor, so it is a good idea to call
 /// [`finish`](#method.finish) or [`flush`](https://doc.rust-lang.org/stable/std/io/trait.Write.html#tymethod.flush) before dropping.
@@ -386,13 +477,15 @@ pub struct StreamWriter<'a, W: Write> {
     index: usize,
     bpp: BytesPerPixel,
     filter: FilterType,
+    adaptive_filter: AdaptiveFilterType,
 }
 
 impl<'a, W: Write> StreamWriter<'a, W> {
     fn new(mut writer: ChunkOutput<'a, W>, buf_len: usize) -> StreamWriter<'a, W> {
         let bpp = writer.as_mut().info.bpp_in_prediction();
         let in_len = writer.as_mut().info.raw_row_length() - 1;
-        let filter = writer.as_mut().info.filter;
+        let filter = writer.as_mut().filter;
+        let adaptive_filter = writer.as_mut().adaptive_filter;
         let prev_buf = vec![0; in_len];
         let curr_buf = vec![0; in_len];
 
@@ -407,6 +500,7 @@ impl<'a, W: Write> StreamWriter<'a, W> {
             curr_buf,
             bpp,
             filter,
+            adaptive_filter,
         }
     }
 
@@ -423,8 +517,14 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
         self.index += written;
 
         if self.index >= self.curr_buf.len() {
-            self.writer.write_all(&[self.filter as u8])?;
-            filter(self.filter, self.bpp, &self.prev_buf, &mut self.curr_buf);
+            let filter_type = filter(
+                self.filter,
+                self.adaptive_filter,
+                self.bpp,
+                &self.prev_buf,
+                &mut self.curr_buf,
+            );
+            self.writer.write_all(&[filter_type as u8])?;
             self.writer.write_all(&self.curr_buf)?;
             mem::swap(&mut self.prev_buf, &mut self.curr_buf);
             self.index = 0;
@@ -436,8 +536,8 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         if self.index > 0 {
-            let message = format!("wrong data size, got {} bytes too many", self.index);
-            return Err(EncodingError::Format(message.into()).into());
+            let err = EncodingError::Format(FormatErrorKind::WrittenTooMuch(self.index).into());
+            return Err(err.into());
         }
         Ok(())
     }
@@ -452,8 +552,7 @@ impl<'a, W: Write> Drop for StreamWriter<'a, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    extern crate glob;
+    use crate::Decoder;
 
     use rand::{thread_rng, Rng};
     use std::fs::File;
@@ -474,7 +573,7 @@ mod tests {
                 }
                 eprintln!("{}", path.display());
                 // Decode image
-                let decoder = crate::Decoder::new(File::open(path).unwrap());
+                let decoder = Decoder::new(File::open(path).unwrap());
                 let (info, mut reader) = decoder.read_info().unwrap();
                 if info.line_size != 32 {
                     // TODO encoding only works with line size 32?
@@ -497,7 +596,7 @@ mod tests {
                     encoder.write_image_data(&buf).unwrap();
                 }
                 // Decode encoded decoded image
-                let decoder = crate::Decoder::new(&*out);
+                let decoder = Decoder::new(&*out);
                 let (info, mut reader) = decoder.read_info().unwrap();
                 let mut buf2 = vec![0; info.buffer_size()];
                 reader.next_frame(&mut buf2).unwrap();
@@ -520,7 +619,7 @@ mod tests {
                     continue;
                 }
                 // Decode image
-                let decoder = crate::Decoder::new(File::open(path).unwrap());
+                let decoder = Decoder::new(File::open(path).unwrap());
                 let (info, mut reader) = decoder.read_info().unwrap();
                 if info.line_size != 32 {
                     // TODO encoding only works with line size 32?
@@ -549,7 +648,7 @@ mod tests {
                     outer_wrapper.write_all(&buf).unwrap();
                 }
                 // Decode encoded decoded image
-                let decoder = crate::Decoder::new(&*out);
+                let decoder = Decoder::new(&*out);
                 let (info, mut reader) = decoder.read_info().unwrap();
                 let mut buf2 = vec![0; info.buffer_size()];
                 reader.next_frame(&mut buf2).unwrap();
@@ -561,44 +660,20 @@ mod tests {
 
     #[test]
     fn image_palette() -> Result<()> {
-        let samples = 3;
         for bit_depth in vec![1u8, 2, 4, 8] {
             // Do a reference decoding, choose a fitting palette image from pngsuite
             let path = format!("tests/pngsuite/basn3p0{}.png", bit_depth);
-            let decoder = crate::Decoder::new(File::open(&path).unwrap());
+            let decoder = Decoder::new(File::open(&path).unwrap());
             let (info, mut reader) = decoder.read_info().unwrap();
 
             let palette: Vec<u8> = reader.info().palette.clone().unwrap();
             let mut decoded_pixels = vec![0; info.buffer_size()];
             assert_eq!(
-                info.width as usize * info.height as usize * samples,
-                decoded_pixels.len()
+                info.width as usize * info.height as usize * usize::from(bit_depth),
+                decoded_pixels.len() * 8
             );
             reader.next_frame(&mut decoded_pixels).unwrap();
-
-            let pixels_per_byte = 8 / usize::from(bit_depth);
-            let mut indexed_data = vec![0; decoded_pixels.len() / samples];
-            {
-                // Retransform the image into palette bits.
-                let mut indexes = vec![];
-                for color in decoded_pixels.chunks(samples) {
-                    let j = palette
-                        .chunks(samples)
-                        .position(|pcolor| color == pcolor)
-                        .unwrap();
-                    indexes.push(j as u8);
-                }
-
-                let idx_per_byte = indexes.chunks(pixels_per_byte);
-                indexed_data.truncate(idx_per_byte.len());
-                for (pixels, byte) in idx_per_byte.zip(&mut indexed_data) {
-                    let mut shift = 8;
-                    for idx in pixels {
-                        shift -= bit_depth;
-                        *byte = *byte | idx << shift;
-                    }
-                }
-            };
+            let indexed_data = decoded_pixels;
 
             let mut out = Vec::new();
             {
@@ -612,12 +687,12 @@ mod tests {
             }
 
             // Decode re-encoded image
-            let decoder = crate::Decoder::new(&*out);
+            let decoder = Decoder::new(&*out);
             let (info, mut reader) = decoder.read_info().unwrap();
             let mut redecoded = vec![0; info.buffer_size()];
             reader.next_frame(&mut redecoded).unwrap();
             // check if the encoded image is ok:
-            assert_eq!(decoded_pixels, redecoded);
+            assert_eq!(indexed_data, redecoded);
         }
         Ok(())
     }
@@ -633,7 +708,7 @@ mod tests {
         let writer = Cursor::new(output);
         let mut encoder = Encoder::new(writer, width as u32, height as u32);
         encoder.set_depth(BitDepth::Eight);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         let mut png_writer = encoder.write_header()?;
 
         let correct_image_size = width * height * 3;
@@ -672,7 +747,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::One);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -682,12 +757,12 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::One);
-        encoder.set_color(ColorType::RGBA);
+        encoder.set_color(ColorType::Rgba);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Two);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -697,12 +772,12 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Two);
-        encoder.set_color(ColorType::RGBA);
+        encoder.set_color(ColorType::Rgba);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Four);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -712,7 +787,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Four);
-        encoder.set_color(ColorType::RGBA);
+        encoder.set_color(ColorType::Rgba);
         assert!(encoder.write_header().is_err());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -767,7 +842,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Eight);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         assert!(encoder.write_header().is_ok());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -782,7 +857,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Eight);
-        encoder.set_color(ColorType::RGBA);
+        encoder.set_color(ColorType::Rgba);
         assert!(encoder.write_header().is_ok());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -792,7 +867,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Sixteen);
-        encoder.set_color(ColorType::RGB);
+        encoder.set_color(ColorType::Rgb);
         assert!(encoder.write_header().is_ok());
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
@@ -802,7 +877,7 @@ mod tests {
 
         let mut encoder = Encoder::new(&mut writer, 1, 1);
         encoder.set_depth(BitDepth::Sixteen);
-        encoder.set_color(ColorType::RGBA);
+        encoder.set_color(ColorType::Rgba);
         assert!(encoder.write_header().is_ok());
 
         Ok(())
@@ -816,7 +891,7 @@ mod tests {
             let mut buffer = vec![];
             let mut encoder = Encoder::new(&mut buffer, 4, 4);
             encoder.set_depth(BitDepth::Eight);
-            encoder.set_color(ColorType::RGB);
+            encoder.set_color(ColorType::Rgb);
             encoder.set_filter(filter);
             encoder.write_header()?.write_image_data(&pixel)?;
 
@@ -848,7 +923,7 @@ mod tests {
             let mut buffer = vec![];
             let mut encoder = Encoder::new(&mut buffer, 4, 4);
             encoder.set_depth(BitDepth::Eight);
-            encoder.set_color(ColorType::RGB);
+            encoder.set_color(ColorType::Rgb);
             encoder.set_filter(FilterType::Avg);
             if let Some(gamma) = gamma {
                 encoder.set_source_gamma(gamma);

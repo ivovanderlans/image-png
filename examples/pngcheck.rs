@@ -56,10 +56,10 @@ fn display_image_type(bits: u8, color: png::ColorType) -> String {
         bits,
         match color {
             Grayscale => "grayscale",
-            RGB => "RGB",
+            Rgb => "RGB",
             Indexed => "palette",
             GrayscaleAlpha => "grayscale+alpha",
-            RGBA => "RGB+alpha",
+            Rgba => "RGB+alpha",
         }
     )
 }
@@ -68,10 +68,10 @@ fn final_channels(c: png::ColorType, trns: bool) -> u8 {
     use png::ColorType::*;
     match c {
         Grayscale => 1 + if trns { 1 } else { 0 },
-        RGB => 3,
+        Rgb => 3,
         Indexed => 3 + if trns { 1 } else { 0 },
         GrayscaleAlpha => 2,
-        RGBA => 4,
+        Rgba => 4,
     }
 }
 fn check_image<P: AsRef<Path>>(c: Config, fname: P) -> io::Result<()> {
@@ -179,7 +179,11 @@ fn check_image<P: AsRef<Path>>(c: Config, fname: P) -> io::Result<()> {
         match decoder.update(buf, &mut Vec::new()) {
             Ok((_, ImageEnd)) => {
                 if !have_idat {
-                    display_error(png::DecodingError::Format("IDAT chunk missing".into()))?;
+                    // This isn't beautiful. But it works.
+                    display_error(png::DecodingError::IoError(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IDAT chunk missing",
+                    )))?;
                     break;
                 }
                 if !c.verbose && !c.quiet {
@@ -238,15 +242,15 @@ fn check_image<P: AsRef<Path>>(c: Config, fname: P) -> io::Result<()> {
                         use png::chunk;
                         n_chunks += 1;
                         if c.verbose {
-                            let chunk = String::from_utf8_lossy(&type_str);
+                            let chunk = type_str;
                             println!("");
                             print!("  chunk ");
                             if c.color {
                                 t.fg(color::YELLOW)?;
-                                write!(t, "{}", chunk)?;
+                                write!(t, "{:?}", chunk)?;
                                 t.reset()?;
                             } else {
-                                print!("{}", chunk)
+                                print!("{:?}", chunk)
                             }
                             print!(
                                 " at offset {:#07x}, length {}",

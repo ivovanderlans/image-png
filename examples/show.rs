@@ -4,7 +4,6 @@ extern crate png;
 
 use std::borrow::Cow;
 use std::env;
-use std::error::Error;
 use std::fs::File;
 use std::io;
 use std::path;
@@ -23,8 +22,8 @@ fn load_image(path: &path::PathBuf) -> io::Result<RawImage2d<'static, u8>> {
     reader.next_frame(&mut img_data)?;
 
     let (data, format) = match info.color_type {
-        RGB => (img_data, ClientFormat::U8U8U8),
-        RGBA => (img_data, ClientFormat::U8U8U8U8),
+        Rgb => (img_data, ClientFormat::U8U8U8),
+        Rgba => (img_data, ClientFormat::U8U8U8U8),
         Grayscale => (
             {
                 let mut vec = Vec::with_capacity(img_data.len() * 3);
